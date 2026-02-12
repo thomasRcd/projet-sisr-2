@@ -1,0 +1,5 @@
+Prenom,Nom,Service,Role,Mail,Password
+prenom1,nom1,Direction,User,prenom1.nom1@tls.vitabigpharma.local,P@ssw0rd!123
+prenom2,nom2,RH,User,prenom2.nom2@tls.vitabigpharma.local,P@ssw0rd!123
+prenom3,nom3,Finance,User,prenom3.nom3@tls.vitabigpharma.local,P@ssw0rd!123
+prenom4,nom4,Finance,DolibarrAdmin,prenom4.nom4@tls.vitabigpharma.local,P@ssw0rd!123
