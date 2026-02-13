@@ -1,135 +1,126 @@
+# ================= VARIABLES =================
 
-# =========================
-# Déploiement AD - Toulouse
-# OU / Groupes / Utilisateurs (métiers) + affectations
-# Domaine : tls.vitabigpharma.local
-# =========================
+$domainDN = "DC=tls,DC=vitabigpharma,DC=local"
+$baseOU   = "OU=Collab,$domainDN"
+$csvPath  = "C:\ton_chemin\users.csv"
+$logFile  = "$env:USERPROFILE\Desktop\log_ad.txt"
+$report   = "$env:USERPROFILE\Desktop\report_users.csv"
 
-Import-Module ActiveDirectory
+$DryRun = $false   # TRUE = simulation
 
-# ---- Paramètres
-$DomainDN = (Get-ADDomain).DistinguishedName
-$SiteOUName = "Toulouse"
+# ================= FONCTIONS =================
 
-# OU
-$OU_Root      = "OU=$SiteOUName,$DomainDN"
-$OU_Users     = "OU=Utilisateurs,$OU_Root"
-$OU_Groups    = "OU=Groupes,$OU_Root"
+function Write-MyLog ($msg) {
+    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') : $msg"
+    Write-Host $line
+    $line | Out-File $logFile -Append -Encoding UTF8
+}
 
-# Groupes métiers (Toulouse = Direction / RH / Finance + ERP Dolibarr)
-$BusinessGroups = @(
-    "TLS-DIRECTION",
-    "TLS-RH",
-    "TLS-FINANCE",
-    "TLS-DOLIBARR-USERS",
-    "TLS-DOLIBARR-ADMINS"
-)
+# Enlever accents
+function Remove-Accents($text) {
+    $normalized = $text.Normalize([Text.NormalizationForm]::FormD)
+    return ($normalized -replace '\p{Mn}', '')
+}
 
-# Chemins fichiers
-$CsvPath = ".\users_tls.csv"
-$LogPath = ".\deploy_log_tls.txt"
+# Générer mot de passe
+function New-RandomPassword {
+    return [System.Web.Security.Membership]::GeneratePassword(12,2)
+}
 
-# ---- Fonctions
-function Ensure-OU {
-    param([string]$OuDn, [string]$OuName, [string]$ParentDn)
+# Générer samAccountName unique
+function Get-UniqueSam($prenom,$nom) {
+    $base = (Remove-Accents("$prenom.$nom")).ToLower() -replace " ", ""
+    $sam = $base
+    $i = 1
 
-    if (-not (Get-ADOrganizationalUnit -LDAPFilter "(distinguishedName=$OuDn)" -ErrorAction SilentlyContinue)) {
-        New-ADOrganizationalUnit -Name $OuName -Path $ParentDn -ProtectedFromAccidentalDeletion $true
-        Add-Content $LogPath "OU créée : $OuDn"
+    while (Get-ADUser -Filter "SamAccountName -eq '$sam'" -ErrorAction SilentlyContinue) {
+        $sam = "$base$i"
+        $i++
+    }
+    return $sam
+}
+
+# ================= STRUCTURE OU =================
+
+if (-not (Get-ADOrganizationalUnit -LDAPFilter "(distinguishedName=$baseOU)" -ErrorAction SilentlyContinue)) {
+    if (!$DryRun) { New-ADOrganizationalUnit -Name "Collab" -Path $domainDN }
+    Write-MyLog "OU Collab créée"
+}
+
+foreach ($ou in @("Users","Ordinateurs","Groupes")) {
+    $target = "OU=$ou,$baseOU"
+    if (-not (Get-ADOrganizationalUnit -LDAPFilter "(distinguishedName=$target)" -ErrorAction SilentlyContinue)) {
+        if (!$DryRun) { New-ADOrganizationalUnit -Name $ou -Path $baseOU }
+        Write-MyLog "OU $ou créée"
     }
 }
 
-function Ensure-Group {
-    param([string]$GroupName, [string]$PathDn)
+# ================= IMPORT CSV =================
 
-    if (-not (Get-ADGroup -Filter "Name -eq '$GroupName'" -ErrorAction SilentlyContinue)) {
-        New-ADGroup -Name $GroupName -GroupScope Global -GroupCategory Security -Path $PathDn
-        Add-Content $LogPath "Groupe créé : $GroupName"
-    }
-}
-
-# ---- Début script
-"==== Déploiement Toulouse - $(Get-Date) ====" | Out-File $LogPath
-
-# Vérifie que le CSV existe
-if (-not (Test-Path $CsvPath)) {
-    Add-Content $LogPath "ERREUR : CSV introuvable ($CsvPath)"
-    Write-Host "ERREUR : CSV introuvable ($CsvPath)" -ForegroundColor Red
-    exit
-}
-
-# 1) Création arborescence OU
-Ensure-OU -OuDn $OU_Root   -OuName $SiteOUName    -ParentDn $DomainDN
-Ensure-OU -OuDn $OU_Users  -OuName "Utilisateurs" -ParentDn $OU_Root
-Ensure-OU -OuDn $OU_Groups -OuName "Groupes"      -ParentDn $OU_Root
-
-# 2) Création des groupes métiers
-foreach ($g in $BusinessGroups){ Ensure-Group -GroupName $g -PathDn $OU_Groups }
-
-# 3) Import CSV + création utilisateurs
-# CSV attendu : Prenom,Nom,Service,Role,Mail,Password
-# Service : Direction | RH | Finance
-# Role    : User | DolibarrAdmin (optionnel)
-$users = Import-Csv $CsvPath
+$users = Import-Csv $csvPath -Delimiter ","
+$reportData = @()
 
 foreach ($u in $users) {
 
-    $Prenom  = $u.Prenom.Trim()
-    $Nom     = $u.Nom.Trim()
-    $Service = $u.Service.Trim()
-    $Role    = $u.Role.Trim()
-    $Mail    = $u.Mail.Trim()
-    $Pwd     = $u.Password
+    $sam = Get-UniqueSam $u.Prenom $u.Nom
+    $pwdPlain = "VitaBigPharma2026!"
+    $pwd = ConvertTo-SecureString $pwdPlain -AsPlainText -Force
 
-    # Login automatique : prenom.nom
-    $Login = ($Prenom + "." + $Nom).ToLower()
-    $Sam   = $Login
+    # OU par service
+    $serviceOU = "OU=$($u.Service),OU=Users,$baseOU"
 
-    $DisplayName = "$Prenom $Nom"
-    $UPN = "$Login@tls.vitabigpharma.local"
-
-    # Vérifie si existe déjà
-    $exists = Get-ADUser -Filter "SamAccountName -eq '$Sam'" -ErrorAction SilentlyContinue
-    if ($exists) {
-        Add-Content $LogPath "Utilisateur déjà existant : $Sam"
-        continue
+    if (-not (Get-ADOrganizationalUnit -LDAPFilter "(ou=$($u.Service))" -SearchBase "OU=Users,$baseOU" -ErrorAction SilentlyContinue)) {
+        if (!$DryRun) { New-ADOrganizationalUnit -Name $u.Service -Path "OU=Users,$baseOU" }
+        Write-MyLog "OU service créée : $($u.Service)"
     }
 
     try {
-        # Création user
-        New-ADUser `
-            -Name $DisplayName `
-            -GivenName $Prenom `
-            -Surname $Nom `
-            -DisplayName $DisplayName `
-            -SamAccountName $Sam `
-            -UserPrincipalName $UPN `
-            -EmailAddress $Mail `
-            -Path $OU_Users `
-            -AccountPassword (ConvertTo-SecureString $Pwd -AsPlainText -Force) `
-            -Enabled $true `
-            -ChangePasswordAtLogon $true
-
-        Add-Content $LogPath "Utilisateur créé : $Sam ($Service / $Role)"
-
-        # Ajout groupe métier (selon Service)
-        $ServiceUpper = $Service.ToUpper()
-        if ($ServiceUpper -in @("DIRECTION","RH","FINANCE")) {
-            $GroupService = "TLS-" + $ServiceUpper
-            Add-ADGroupMember -Identity $GroupService -Members $Sam
+        if (!$DryRun) {
+            New-ADUser `
+                -Name "$($u.Prenom) $($u.Nom)" `
+                -GivenName $u.Prenom `
+                -Surname $u.Nom `
+                -SamAccountName $sam `
+                -UserPrincipalName $u.Email `
+                -Path $serviceOU `
+                -AccountPassword $pwd `
+                -Enabled $true `
+                -ChangePasswordAtLogon $true
         }
 
-        # Ajout aux groupes Dolibarr (ERP Toulouse)
-        Add-ADGroupMember -Identity "TLS-DOLIBARR-USERS" -Members $Sam
+        Write-MyLog "User créé : $sam"
 
-        if ($Role.ToLower() -eq "dolibarradmin") {
-            Add-ADGroupMember -Identity "TLS-DOLIBARR-ADMINS" -Members $Sam
+        # Groupe
+        if (-not (Get-ADGroup -Filter "Name -eq '$($u.Groupe)'" -ErrorAction SilentlyContinue)) {
+            if (!$DryRun) {
+                New-ADGroup -Name $u.Groupe -GroupScope Global -GroupCategory Security -Path "OU=Groupes,$baseOU"
+            }
+            Write-MyLog "Groupe créé : $($u.Groupe)"
         }
 
-    } catch {
-        Add-Content $LogPath "ERREUR création $Sam : $($_.Exception.Message)"
+        if (!$DryRun) {
+            Add-ADGroupMember -Identity $u.Groupe -Members $sam
+        }
+        Write-MyLog "$sam ajouté à $($u.Groupe)"
+
+        # Rapport
+        $reportData += [PSCustomObject]@{
+            Prenom = $u.Prenom
+            Nom = $u.Nom
+            SamAccountName = $sam
+            Email = $u.Email
+            Service = $u.Service
+            Groupe = $u.Groupe
+            Password = $pwdPlain
+        }
+    }
+    catch {
+        Write-MyLog "ERREUR $sam : $($_.Exception.Message)"
     }
 }
 
-Add-Content $LogPath "==== Fin - $(Get-Date) ===="
-Write-Host "Terminé. Log : $LogPath"
+# Export rapport
+$reportData | Export-Csv $report -NoTypeInformation -Encoding UTF8
+Write-MyLog "Rapport exporté : $report"
+
+
